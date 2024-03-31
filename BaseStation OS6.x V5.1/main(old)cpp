@@ -1,0 +1,347 @@
+#include "./main_functions_constants/Nucleo/Nucleo.h"
+
+#include <cstdint>
+
+#include "Constants.h"
+#include "mbed.h"
+
+/**************************************************************
+**                       MAIN
+***************************************************************/
+int main()
+{   
+   buzzer.period_ms(1);
+   //buzzer.write(0.20f);      // 20% duty cycle, relative to period
+
+	Nucleo_Init();
+	pc.set_baud(500'000);                                       // Set Serial baud-rate
+	//pc.set_blocking(false);
+    //pc.enable_input(true);
+    //pc.enable_output(true);
+
+    uint8_t stationData[32];
+    
+    //BNO Test und Ausgabe, sonst noch nicht genutzt
+    
+    BNO055 bno(I2C_SDA, I2C_SCL);
+    bno.reset();
+    bno.set_mapping(3);
+    ThisThread::sleep_for(100ms);
+    //wait_ms(100);
+    bno.get_mapping();
+    bno.setmode(OPERATION_MODE_NDOF);
+    ThisThread::sleep_for(100ms);
+    //wait_ms(100);
+    /* while(true) {
+        readQuatLinAccCompressed(&bno, stationData);
+        sendDataToBS(DATATYPE_StationIMUData, stationData, 13);
+        ThisThread::sleep_for(10ms);    //100 Frequenz
+        //wait_ms(10);
+    }*/
+    
+	mode = 0;							// default: Quaternion only mode
+    uint8_t numNodes = 0;               // No nodes available at beginning
+    uint8_t broadcast_counter = 0;      // Wann Broadcast abgefragt werden soll, am besten ein vielfaches von der Anzahl der verbundenen Nodes, damit jede Node mehrmals abgefagt werden und nicht so viele Broadcast gemacht werden
+	uint8_t loop_pass_for_query = 16;   // Teilt den BradcastCounter und gibt an wie oft jede Node abgefagt werden soll
+
+    nrf.init(0x69, DR_1M, NRF_ADDR_LEN, 1);
+	
+	nrf.openDynamicTXPipe(nrf_broadcast_address, true, false); //darf nicht von Anfang an auf der broadcast-adresse sein, sonst bleibt die BS hängen muss ich also ändern
+	//nrf.openDynamicTXPipe(nrf_data_address, true, false);
+
+	// do not use interrupts, use polling instead
+    nrf.maskIRQ(true, true, true);
+	
+	nrf.setModeTX();
+    nrf.flushTX();
+    nrf.flushRX();
+    nrf.resetIRQFlags();
+	
+    //Attach the address of the Button Interrupt function to the falling edge
+    button.fall(&Button_Interrupt); 
+    button.enable_irq();
+    
+    bool rx, txDone, maxTry;
+    
+    uint8_t rxLen = 0;
+    uint8_t pipe = 0;
+    
+    uint8_t* currentBuffer = RX_buffer_1;
+    
+    // prevent mbed from going into deep sleep
+    DeepSleepLock lock;
+
+    // set num retries higher and set it back to 1 after init phase
+	nrf.setRetries(500, 5);
+
+    // check if nodes already are online (e.g. when base station was reset during a session)
+    // if so, recover session
+    recoverNodes(numNodes);
+
+    if (sessionID < 0xFF) {
+        sessionID += 1; //setzen der neusten ID + 1
+    } else {
+        sessionID = 0x00;  //neuste ID ist 255, also wieder mit 0 beginnen
+        //serial_write(&sessionID, 1);
+    }
+
+    
+    sendCommand(COMMAND_TYPE_UPDATE_COMMAND, UPDATE_COMMAND_SESSION_ID, &sessionID, 1);  //Senden der aktuellen SessionID an die Gloves
+    ThisThread::sleep_for(2s);
+    //sendCommand(COMMAND_RestartNode);
+
+    //send number of nodes and session id via the serial interface in order to use it
+    sendDataToBS(COMMAND_TYPE_BASESTATION_COMMAND, BASESTATION_DATATYPE_NUMBER_OF_NODES, &numNodes, 1); 
+    ThisThread::sleep_for(1ms);
+    sendDataToBS(COMMAND_TYPE_BASESTATION_COMMAND, BASESTATION_DATATYPE_SESSION_ID, &sessionID, 2);
+    // ThisThread::sleep_for(1ms);
+    
+
+    // only 1 retry after 500us to ensure high performance and short reaction times
+	nrf.setRetries(500, 1);
+
+    curNode = getFirstNodeID(confNodes);
+
+    //#########TODO
+    //## Befehle anpassen und testen, aber zuerst den Empfang von Daten auf der seriellen Schnittstelle prüfen, siehe TODO unten und extra fall für 0xA0
+    //## Ändern des seriellen Empfangs mit den neuen Konstanten
+
+    // ######################################################################################################
+    // Main loop starts here:
+    // Loop through all sensors, receive and forward data, and regularly check if new sensors available
+    // ######################################################################################################
+
+    char msg[] = "Echoes back to the screen anything you type\n";
+    char *buff = new char[1];
+    pc.write(msg, sizeof(msg));
+
+    int cnt{0};
+    //int sendCnt{0};                                   //For debugging only
+    int dataCnt{0};
+    bool add{true};
+    bool dataExtracted{false};
+
+    uint8_t commandDuration{0};
+    uint16_t commandRecipient{0};
+    CommandType commandType = COMMAND_TYPE_UNKNOWN;
+    uint8_t cmd = COMMAND_UNKNOWN;
+    uint8_t cmdLength{0};
+    bool dataAvailable{false};
+
+    //buzzer.write(0.20f);
+
+    curNode = getFirstNodeID(confNodes);
+
+    while (1)
+    {
+
+        if (pc.readable()) {    //TODO als zweite einfügen der Macros
+            dataAvailable = true;
+            while(cnt < 32) {
+                if (pc.readable()) {
+                    pc.read(buff, sizeof(buff));
+                    if (buff[0] == 0xA0 && cnt > 4) { //Das dritte und/oder vierte Byte kann jeweils theoretisch auch 0xA0 sein, wenn der Befehl für die Nodes 13 & 15 und/oder 5 & 7 ist. Damit dann trotzdem der Befehl und eventuelle Daten noch eingelesen werden, dürfen die Daten erst nach dem vierten Byte  "ignoriert" werden, wenn 0xA0 erscheint. // Sync-Bytes (AB CD) + Duration-Byte (00 or 01) + Recipient-Bytes (0x0000 - 0xFFFF => 3tes und 4tes Byte) 
+                    //Fehler wenn die SessionID mit dem Wert 160 geupdatet werden soll. erstmal ignorieren ()
+                        add = false;
+                    }
+                    if (add == true) {
+                        addToBuffer(buff, dataCnt);
+                        dataCnt++;
+                    }
+                    cnt++;
+                }   
+            }
+
+            dataExtracted = extractCommandData(serialRXBuffer, dataCnt, commandBuffer, commandDuration, commandRecipient, commandType, cmd, cmdLength);
+
+        }
+
+        if (mode == 2) {    //for Testing, later when commands are possible, maybe do it in a different way
+            //sendDataToBS(DATATYPE_ModeOfNode, (uint8_t *)&mode, 1); //Senden von Mode 2
+            sendCommand(COMMAND_TYPE_INFO_COMMAND, INFO_COMMAND_CALIBRATION_DATA);
+            nrf.setTXAddress(nrf_data_address, NRF_ADDR_LEN);
+            nrf.setRXAddress(0, nrf_data_address, NRF_ADDR_LEN);
+        }
+
+        if (mode == 3) {    //for Testing, later when commands are possible, maybe do it in a different way
+            readQuatLinAccCompressed(&bno, stationData);
+            sendDataToBS(COMMAND_TYPE_BASESTATION_COMMAND, BASESTATION_DATATYPE_BNO, stationData, 13);
+            ThisThread::sleep_for(10ms);    //100 Frequenz
+        }
+
+        if (dataAvailable) {
+                
+            if (dataExtracted) { //if 255 eigentlich nicht mehr nötig maximal if 0 == basisstation, alles andere ist bitcodiert und muss dann rausgeholt werden
+                /*if (commandRecipient > 255) {   //Alles größer 255 ist für die Basisstation, alles <= 255 ist für die Nodes
+                    uint8_t receivedCommand[BUFFER_LENGTH] = {0};
+                    receivedCommand[0] = commandRecipient & 0xFF;   //Empfänger 1
+                    receivedCommand[1] = commandRecipient >> 8;     //Empfänger 2
+                    receivedCommand[2] = commandType;               //CommandType
+                    receivedCommand[3] = cmd;                       //Commandngth
+                    receivedCommand[4] = cmdLength;                 //CommandLength
+                    if (cmdLength == 1) {
+                        receivedCommand[5] = commandBuffer[0];
+                    }
+                    
+                    serial_write(receivedCommand, 5+cmdLength);
+                    buzzer.write(0.20f);        // 20% duty cycle, relative to period
+                    ThisThread::sleep_for(100ms);
+                    buzzer.write(0.0f);         // 0% duty cycle, relative to period
+                }else {                        // für die Nodes. //TODO morgen direkt noch ausprobieren
+                    uint8_t receivedCommand[BUFFER_LENGTH] = {0};
+                    receivedCommand[0] = commandRecipient & 0xFF;   //Empfänger MSB
+                    receivedCommand[1] = commandRecipient >> 8;     //Empfänger LSB
+                    receivedCommand[2] = commandType;               //CommandType
+                    receivedCommand[3] = cmd;                       //Commandngth
+                    receivedCommand[4] = cmdLength;                 //CommandLength
+                    if (cmdLength == 1) {
+                        receivedCommand[5] = commandBuffer[0];
+                    }
+                    
+                    serial_write(receivedCommand, 5+cmdLength); 
+                    buzzer.write(0.20f);        // 20% duty cycle, relative to period
+                    ThisThread::sleep_for(100ms);
+                    buzzer.write(0.0f);         // 0% duty cycle, relative to period
+                    ThisThread::sleep_for(100ms);
+                    buzzer.write(0.20f);        // 20% duty cycle, relative to period
+                    ThisThread::sleep_for(100ms);
+                    buzzer.write(0.0f);         // 0% duty cycle, relative to period
+                }*/
+                //sendCommand(COMMAND_RestartNode);
+                //sendCommand(cmd, commandBuffer, cmdLength, false, 255);
+                uint8_t receivedCommand[BUFFER_LENGTH] = {0};
+                receivedCommand[0] = commandDuration;           //Dauer
+                receivedCommand[1] = commandRecipient >> 8;     //Empfänger 1
+                receivedCommand[2] = commandRecipient & 0xFF;   //Empfänger 2
+                receivedCommand[3] = commandType;               //CommandType
+                receivedCommand[4] = cmd;                       //Command
+                receivedCommand[5] = cmdLength;                 //CommandLength
+                if (cmdLength == 1) {
+                    receivedCommand[6] = commandBuffer[0];
+                }
+                serial_write(receivedCommand, 6+cmdLength);
+                
+                buzzer.write(0.20f);        // 20% duty cycle, relative to period
+                ThisThread::sleep_for(100ms);
+                buzzer.write(0.0f);         // 0% duty cycle, relative to period
+
+                //TODO ausprobieren ob alle Befehle richtig empfangen und ausgewertet wurden
+
+                /*
+                if (commandType == COMMAND_TYPE_MODE_COMMAND) {
+                    BS_payload_command[0] = COMMAND_TYPE_MODE_COMMAND;
+                    BS_payload_command[1] = cmd;
+                    ThisThread::sleep_for(100ms);
+                    buzzer.write(0.20f);        // 20% duty cycle, relative to period
+                    ThisThread::sleep_for(100ms);
+                    buzzer.write(0.0f);         // 0% duty cycle, relative to period
+                }
+                else if (commandType == COMMAND_TYPE_GENERAL_COMMAND) {
+                    if (cmd == GENERAL_COMMAND_RESTART) {
+                        BS_payload_command[0] = COMMAND_TYPE_GENERAL_COMMAND;
+                        BS_payload_command[1] = GENERAL_COMMAND_RESTART;
+                        
+                        ThisThread::sleep_for(100ms);
+                        buzzer.write(0.20f);        // 20% duty cycle, relative to period
+                        ThisThread::sleep_for(100ms);
+                        buzzer.write(0.0f);         // 0% duty cycle, relative to period
+                        ThisThread::sleep_for(100ms);
+                        buzzer.write(0.20f);        // 20% duty cycle, relative to period
+                        ThisThread::sleep_for(100ms);
+                        buzzer.write(0.0f);         // 0% duty cycle, relative to period
+                    }
+                }*/
+
+            } else {
+                serialRXBuffer[33] = cnt;
+                serialRXBuffer[34] = dataCnt;
+                pc.write(serialRXBuffer, 35);
+            }
+            //sendCommand(COMMAND_RestartNode);
+            dataAvailable = false;
+            dataExtracted = false;
+            cnt = 0;
+            dataCnt = 0;
+            add = true;
+            ThisThread::sleep_for(1s);
+        }
+        
+        if (curNode < 16) {
+            //BS_payload_command[1] = mode;
+            nrf.writeTXData(BS_payload_command, 2);
+            //nrf.writeTXData(BS_payload_TX + mode, 1);
+            // TODO: set request data, replace BS_payload_TX (only 1 byte should be sufficient)
+        }
+
+        // get status and reset interrupt flags
+        nrf.getIRQStatus(rx, txDone, maxTry);
+    	nrf.resetIRQFlags();
+        
+        rxLen = 0;
+        
+        if (rx)
+        {
+			while (nrf.dataAvailable())
+			{
+				nrf.readRXData(currentBuffer, rxLen, pipe);
+				
+	        	if (rxLen > 5 && mode < 3)
+	        	{  
+                    serial_write(currentBuffer, rxLen); //wieder einfügen
+		        	
+		        	// change buffer to not accidentially ovwerwrite data while sending via serial port in parallel
+		        	if (currentBuffer == RX_buffer_1)
+		        	{
+		        		currentBuffer = RX_buffer_2;
+		        	}
+		        	else
+		        	{
+		        		currentBuffer = RX_buffer_1;
+		        	}
+                    //readQuatLinAccCompressed(&bno, stationData);
+                    //sendDataToBS(DATATYPE_StationIMUData, stationData, 13);
+                    //alle Daten abfragen mit
+                    nrf.writeTXData(BS_payload_TX + mode, 1);
+				} else {
+                    break;
+                }
+			}
+
+		}
+		
+        else if (txDone || maxTry || curNode > 15) //if ((txDone && rxLen == 0) || maxTry)
+		{   
+            broadcast_counter++;
+
+            if ((broadcast_counter/loop_pass_for_query) == numNodes) {
+                freeNodeID = getNextFreeNodeID(confNodes);
+                if (freeNodeID < 16) {
+                    do_broadcast(mode, freeNodeID, sessionID, numNodes);
+                }
+                //findInactiveNodes(confNodes, activNodes);
+                if (dataChanged) {
+                    if (sessionID < 255) {
+                        sessionID++;
+                    } else {
+                        sessionID = 0;
+                    }
+                    sendDataToBS(COMMAND_TYPE_BASESTATION_COMMAND, BASESTATION_DATATYPE_SESSION_ID, &sessionID, 1);
+                    ThisThread::sleep_for(1ms);
+                    //wait_ms(1); //needed that both information-data are received otherwise the first on will not be received
+                    sendDataToBS(COMMAND_TYPE_BASESTATION_COMMAND, BASESTATION_DATATYPE_NUMBER_OF_NODES, &numNodes, 1);
+                    dataChanged = false;
+                }
+                broadcast_counter = 0;
+            }
+
+            curNode = getNextNodeID(confNodes, curNode);
+            if (curNode < 16) {
+                nrf_data_address[4] = curNode;
+                nrf.setTXAddress(nrf_data_address, NRF_ADDR_LEN);
+                nrf.setRXAddress(0, nrf_data_address, NRF_ADDR_LEN);
+            }
+
+	    	continue; //kann eigentlich weg, wird aber wahrscheinlich eh weg opitimiert und ist erstmal egal
+		}
+    }
+}
